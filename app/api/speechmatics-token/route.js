@@ -1,6 +1,6 @@
-// Gets a short-lived token from Speechmatics so the browser can connect directly
-// to the realtime WebSocket without exposing the long-lived API key.
-export async function POST() {
+// Gets a short-lived JWT from Speechmatics for browser WebSocket connection.
+// Uses the official Speechmatics auth endpoint.
+export async function POST(request) {
   const apiKey = process.env.SPEECHMATICS_API_KEY;
   if (!apiKey) {
     return Response.json({ error: 'SPEECHMATICS_API_KEY not set' }, { status: 500 });
@@ -11,21 +11,21 @@ export async function POST() {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${apiKey}`,
+        'Authorization': `Bearer ${apiKey}`,
       },
-      body: JSON.stringify({ ttl: 60 }), // 60 second token
+      body: JSON.stringify({ ttl: 3600 }), // 1 hour token
     });
 
     if (!res.ok) {
       const text = await res.text();
       console.error('Speechmatics token error:', res.status, text);
-      return Response.json({ error: 'Failed to get token' }, { status: res.status });
+      return Response.json({ error: `Token error: ${res.status} - ${text}` }, { status: res.status });
     }
 
     const data = await res.json();
     return Response.json({ key_value: data.key_value });
   } catch (err) {
     console.error('Token fetch error:', err);
-    return Response.json({ error: 'Token fetch failed' }, { status: 500 });
+    return Response.json({ error: err.message }, { status: 500 });
   }
 }

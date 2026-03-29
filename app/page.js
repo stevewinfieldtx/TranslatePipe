@@ -3,8 +3,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 
 // ─── Language config ───────────────────────────────────────────────
-// Speechmatics translation works to/from English. For non-English pairs,
-// we'd need a pivot through English (future enhancement).
+// Speechmatics translation works to/from English for most pairs.
 const LANGUAGES = [
   { code: 'en', label: 'English',    flag: '🇺🇸' },
   { code: 'vi', label: 'Vietnamese', flag: '🇻🇳' },
@@ -53,11 +52,25 @@ const styles = {
     flexDirection: 'column',
     gap: '24px',
   },
+  directionHint: {
+    textAlign: 'center',
+    fontSize: '0.8rem',
+    color: '#666',
+    marginTop: '-8px',
+  },
   langRow: {
     display: 'flex',
     alignItems: 'center',
     gap: '16px',
     justifyContent: 'center',
+  },
+  langLabel: {
+    fontSize: '0.65rem',
+    textTransform: 'uppercase',
+    letterSpacing: '0.15em',
+    color: '#555',
+    textAlign: 'center',
+    marginBottom: '4px',
   },
   select: {
     background: 'rgba(255,255,255,0.05)',
@@ -104,9 +117,7 @@ const styles = {
     margin: '20px auto',
     boxShadow: active ? '0 0 40px rgba(34,197,94,0.2)' : 'none',
   }),
-  micIcon: {
-    fontSize: '2.2rem',
-  },
+  micIcon: { fontSize: '2.2rem' },
   micLabel: {
     fontSize: '0.65rem',
     textTransform: 'uppercase',
@@ -133,7 +144,7 @@ const styles = {
     color: '#888',
     fontSize: '0.9rem',
     lineHeight: 1.6,
-    marginBottom: '8px',
+    marginBottom: '4px',
     fontStyle: 'italic',
   },
   translatedText: {
@@ -195,13 +206,12 @@ const styles = {
 };
 
 export default function TranslatePipe() {
-  // ─── State ──────────────────────────────────────────────────────
-  const [langA, setLangA] = useState('en');
-  const [langB, setLangB] = useState('vi');
+  const [speakLang, setSpeakLang] = useState('en');    // language you SPEAK
+  const [hearLang, setHearLang] = useState('vi');      // language you HEAR (translation output)
   const [isListening, setIsListening] = useState(false);
-  const [entries, setEntries] = useState([]); // { original, translated, lang }
+  const [entries, setEntries] = useState([]);
   const [partial, setPartial] = useState('');
-  const [status, setStatus] = useState('Select languages and tap the mic');
+  const [status, setStatus] = useState('Pick your languages and tap the mic');
   const [autoSpeak, setAutoSpeak] = useState(true);
   const [isSpeaking, setIsSpeaking] = useState(false);
 
@@ -212,8 +222,8 @@ export default function TranslatePipe() {
   const ttsQueueRef = useRef([]);
   const isSpeakingRef = useRef(false);
   const transcriptEndRef = useRef(null);
+  const lastOriginalRef = useRef('');
 
-  // Auto-scroll transcript
   useEffect(() => {
     transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [entries, partial]);
@@ -221,22 +231,19 @@ export default function TranslatePipe() {
   // ─── TTS Queue ──────────────────────────────────────────────────
   const speakText = useCallback(async (text, targetLang) => {
     if (!autoSpeak || !text.trim()) return;
-
     ttsQueueRef.current.push({ text, targetLang });
-    if (isSpeakingRef.current) return; // already processing queue
+    if (isSpeakingRef.current) return;
 
     while (ttsQueueRef.current.length > 0) {
       isSpeakingRef.current = true;
       setIsSpeaking(true);
       const { text: t, targetLang: lang } = ttsQueueRef.current.shift();
-
       try {
         const res = await fetch('/api/tts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ text: t, language: lang }),
         });
-
         if (res.ok) {
           const audioBlob = await res.blob();
           const url = URL.createObjectURL(audioBlob);
@@ -249,55 +256,40 @@ export default function TranslatePipe() {
           URL.revokeObjectURL(url);
         }
       } catch (err) {
-        console.error('TTS playback error:', err);
+        console.error('TTS error:', err);
       }
     }
-
     isSpeakingRef.current = false;
     setIsSpeaking(false);
   }, [autoSpeak]);
 
-  // ─── Start listening ────────────────────────────────────────────
+  // ─── Start ──────────────────────────────────────────────────────
   const startListening = useCallback(async () => {
     try {
-      // 1. Get mic access
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          channelCount: 1,
-          sampleRate: 16000,
-          echoCancellation: true,
-          noiseSuppression: true,
-        },
+        audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true },
       });
       mediaStreamRef.current = stream;
 
-      // 2. Get Speechmatics temp token
       setStatus('Getting auth token...');
       const tokenRes = await fetch('/api/speechmatics-token', { method: 'POST' });
       const tokenData = await tokenRes.json();
       if (!tokenData.key_value) {
-        setStatus('Auth failed — check SPEECHMATICS_API_KEY');
+        setStatus(`Auth failed: ${tokenData.error || 'no token'}`);
         stream.getTracks().forEach(t => t.stop());
         return;
       }
 
-      // 3. Determine source language and target
-      // Speechmatics transcribes in the source language and translates to target(s)
-      // The user speaks Language A, we transcribe in A, translate to B
-      // OR they speak Language B, we transcribe in B, translate to A
-      // We use 'auto' for language detection so it handles both directions
-      const sourceLang = 'auto';
-      const targetLangs = [langA, langB]; // translate to both — we'll figure out which is "other"
-
-      // 4. Connect WebSocket
-      setStatus('Connecting to Speechmatics...');
-      const wsUrl = `wss://eu2.rt.speechmatics.com/v2?jwt=${tokenData.key_value}`;
+      // Connect WebSocket with source language in the URL path
+      setStatus('Connecting...');
+      const wsUrl = `wss://eu2.rt.speechmatics.com/v2/${speakLang}?jwt=${tokenData.key_value}`;
+      console.log('Connecting to:', wsUrl.replace(tokenData.key_value, 'JWT_REDACTED'));
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
-        // Send StartRecognition
-        ws.send(JSON.stringify({
+        console.log('WebSocket open, sending StartRecognition');
+        const config = {
           message: 'StartRecognition',
           audio_format: {
             type: 'raw',
@@ -305,145 +297,125 @@ export default function TranslatePipe() {
             sample_rate: 16000,
           },
           transcription_config: {
-            language: sourceLang,
+            language: speakLang,
             operating_point: 'enhanced',
             enable_partials: true,
             max_delay: 2,
           },
           translation_config: {
-            target_languages: targetLangs,
+            target_languages: [hearLang],
             enable_partials: true,
           },
-        }));
+        };
+        console.log('Config:', JSON.stringify(config, null, 2));
+        ws.send(JSON.stringify(config));
       };
 
       ws.onmessage = (event) => {
         const msg = JSON.parse(event.data);
+        console.log('SM msg:', msg.message, msg.language || '');
 
         switch (msg.message) {
           case 'RecognitionStarted':
-            setStatus('Listening — speak now');
+            setStatus(`Listening — speak ${LANGUAGES.find(l => l.code === speakLang)?.label || speakLang}`);
             setIsListening(true);
             startAudioPipeline(stream, ws);
             break;
 
           case 'AddPartialTranscript': {
-            const text = msg.metadata?.transcript || msg.results?.map(r =>
-              r.alternatives?.[0]?.content || ''
-            ).join(' ') || '';
-            if (text.trim()) setPartial(text.trim());
+            const text = msg.metadata?.transcript ||
+              msg.results?.map(r => r.alternatives?.[0]?.content || '').join(' ') || '';
+            if (text.trim()) setPartial(`[hearing] ${text.trim()}`);
             break;
           }
 
           case 'AddTranscript': {
-            const text = msg.metadata?.transcript || msg.results?.map(r =>
-              r.alternatives?.[0]?.content || ''
-            ).join(' ') || '';
+            const text = msg.metadata?.transcript ||
+              msg.results?.map(r => r.alternatives?.[0]?.content || '').join(' ') || '';
             if (text.trim()) {
+              lastOriginalRef.current = text.trim();
               setPartial('');
-              // We'll wait for the translation to pair it
             }
             break;
           }
 
           case 'AddPartialTranslation': {
-            // Show partial translation as preview
-            const partialTrans = msg.results?.map(r => r.content).join(' ') || '';
-            if (partialTrans.trim()) {
-              setPartial(partialTrans.trim());
-            }
+            const pt = msg.results?.map(r => r.content).join(' ') || '';
+            if (pt.trim()) setPartial(`→ ${pt.trim()}`);
             break;
           }
 
           case 'AddTranslation': {
-            // This is the final translation — the money event
             const translated = msg.results?.map(r => r.content).join(' ') || '';
-            const transLang = msg.language; // which language this translation is in
-
             if (translated.trim()) {
               setPartial('');
-
-              // Figure out which direction: if translated language matches langA,
-              // then speaker was speaking langB (and vice versa)
-              const spokenLang = transLang === langA ? langB : langA;
-              const targetLang = transLang;
-
-              // Only show translations that are in the "other" language
-              // (skip the one that matches the spoken language)
-              if (transLang !== spokenLang) {
-                setEntries(prev => [...prev, {
-                  original: `[${LANGUAGES.find(l => l.code === spokenLang)?.label || spokenLang}]`,
-                  translated: translated.trim(),
-                  lang: targetLang,
-                }]);
-
-                // Speak it
-                speakText(translated.trim(), targetLang);
-              }
+              const original = lastOriginalRef.current || '...';
+              setEntries(prev => [...prev, {
+                original,
+                translated: translated.trim(),
+                lang: msg.language || hearLang,
+              }]);
+              speakText(translated.trim(), msg.language || hearLang);
+              lastOriginalRef.current = '';
             }
             break;
           }
 
           case 'Error':
-            console.error('Speechmatics error:', msg);
-            setStatus(`Error: ${msg.reason || msg.type || 'Unknown'}`);
+            console.error('SM Error:', JSON.stringify(msg));
+            setStatus(`Error: ${msg.reason || msg.type || JSON.stringify(msg)}`);
             break;
 
           case 'EndOfTranscript':
             setStatus('Session ended');
             break;
+
+          case 'AudioAdded':
+          case 'Info':
+            break; // ignore
+
+          default:
+            console.log('Unhandled SM message:', msg.message);
         }
       };
 
       ws.onerror = (err) => {
-        console.error('WebSocket error:', err);
-        setStatus('Connection error — try again');
+        console.error('WS error:', err);
+        setStatus('Connection error — check console');
         stopListening();
       };
 
       ws.onclose = (event) => {
-        console.log('WebSocket closed:', event.code, event.reason);
-        if (isListening) {
-          setStatus('Connection closed');
-          setIsListening(false);
-        }
+        console.log('WS closed:', event.code, event.reason);
+        setStatus(`Disconnected (${event.code})`);
+        setIsListening(false);
       };
-
     } catch (err) {
       console.error('Start error:', err);
       setStatus(`Error: ${err.message}`);
     }
-  }, [langA, langB, speakText, isListening]);
+  }, [speakLang, hearLang, speakText]);
 
   // ─── Audio pipeline ─────────────────────────────────────────────
   const startAudioPipeline = useCallback((stream, ws) => {
-    const audioContext = new (window.AudioContext || window.webkitAudioContext)({
-      sampleRate: 16000,
-    });
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
     audioContextRef.current = audioContext;
-
     const source = audioContext.createMediaStreamSource(stream);
-
-    // ScriptProcessor to capture PCM chunks
     const processor = audioContext.createScriptProcessor(4096, 1, 1);
     processorRef.current = processor;
 
     processor.onaudioprocess = (e) => {
       if (ws.readyState === WebSocket.OPEN) {
         const inputData = e.inputBuffer.getChannelData(0);
-        // Send as raw float32 PCM
-        const buffer = new Float32Array(inputData);
-        ws.send(buffer.buffer);
+        ws.send(new Float32Array(inputData).buffer);
       }
     };
-
     source.connect(processor);
     processor.connect(audioContext.destination);
   }, []);
 
-  // ─── Stop listening ─────────────────────────────────────────────
+  // ─── Stop ───────────────────────────────────────────────────────
   const stopListening = useCallback(() => {
-    // Close WebSocket
     if (wsRef.current) {
       try {
         if (wsRef.current.readyState === WebSocket.OPEN) {
@@ -453,41 +425,24 @@ export default function TranslatePipe() {
       } catch (e) { /* ignore */ }
       wsRef.current = null;
     }
-
-    // Stop audio
-    if (processorRef.current) {
-      processorRef.current.disconnect();
-      processorRef.current = null;
-    }
-    if (audioContextRef.current) {
-      audioContextRef.current.close().catch(() => {});
-      audioContextRef.current = null;
-    }
-    if (mediaStreamRef.current) {
-      mediaStreamRef.current.getTracks().forEach(t => t.stop());
-      mediaStreamRef.current = null;
-    }
-
+    if (processorRef.current) { processorRef.current.disconnect(); processorRef.current = null; }
+    if (audioContextRef.current) { audioContextRef.current.close().catch(() => {}); audioContextRef.current = null; }
+    if (mediaStreamRef.current) { mediaStreamRef.current.getTracks().forEach(t => t.stop()); mediaStreamRef.current = null; }
     setIsListening(false);
     setPartial('');
     setStatus('Stopped — tap mic to restart');
   }, []);
 
-  // ─── Swap languages ─────────────────────────────────────────────
   const swapLangs = () => {
-    if (isListening) return; // don't swap while active
-    setLangA(langB);
-    setLangB(langA);
+    if (isListening) return;
+    setSpeakLang(hearLang);
+    setHearLang(speakLang);
   };
 
-  // ─── Render ─────────────────────────────────────────────────────
   return (
     <div style={styles.page}>
       <style>{`
-        @keyframes pulse {
-          0%, 100% { opacity: 1; }
-          50% { opacity: 0.3; }
-        }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
         select option { background: #1a1a2e; color: #fff; }
         ::-webkit-scrollbar { width: 4px; }
         ::-webkit-scrollbar-track { background: transparent; }
@@ -498,92 +453,62 @@ export default function TranslatePipe() {
       <p style={styles.subtitle}>Pure voice translation — no AI conversation</p>
 
       <div style={styles.container}>
-        {/* Language selectors */}
         <div style={styles.langRow}>
-          <select
-            style={styles.select}
-            value={langA}
-            onChange={(e) => setLangA(e.target.value)}
-            disabled={isListening}
-          >
-            {LANGUAGES.filter(l => l.code !== langB).map(l => (
-              <option key={l.code} value={l.code}>
-                {l.flag}  {l.label}
-              </option>
-            ))}
-          </select>
+          <div>
+            <div style={styles.langLabel}>I speak</div>
+            <select style={styles.select} value={speakLang} onChange={(e) => setSpeakLang(e.target.value)} disabled={isListening}>
+              {LANGUAGES.filter(l => l.code !== hearLang).map(l => (
+                <option key={l.code} value={l.code}>{l.flag}  {l.label}</option>
+              ))}
+            </select>
+          </div>
 
-          <button
-            style={styles.swapBtn}
-            onClick={swapLangs}
-            disabled={isListening}
-            title="Swap languages"
-          >
-            ⇄
-          </button>
+          <button style={styles.swapBtn} onClick={swapLangs} disabled={isListening} title="Swap languages">⇄</button>
 
-          <select
-            style={styles.select}
-            value={langB}
-            onChange={(e) => setLangB(e.target.value)}
-            disabled={isListening}
-          >
-            {LANGUAGES.filter(l => l.code !== langA).map(l => (
-              <option key={l.code} value={l.code}>
-                {l.flag}  {l.label}
-              </option>
-            ))}
-          </select>
+          <div>
+            <div style={styles.langLabel}>Translate to</div>
+            <select style={styles.select} value={hearLang} onChange={(e) => setHearLang(e.target.value)} disabled={isListening}>
+              {LANGUAGES.filter(l => l.code !== speakLang).map(l => (
+                <option key={l.code} value={l.code}>{l.flag}  {l.label}</option>
+              ))}
+            </select>
+          </div>
         </div>
 
-        {/* Mic button */}
-        <button
-          style={styles.micBtn(isListening)}
-          onClick={isListening ? stopListening : startListening}
-        >
+        <div style={styles.directionHint}>
+          Speak {LANGUAGES.find(l => l.code === speakLang)?.label} → hear {LANGUAGES.find(l => l.code === hearLang)?.label}
+        </div>
+
+        <button style={styles.micBtn(isListening)} onClick={isListening ? stopListening : startListening}>
           <span style={styles.micIcon}>{isListening ? '⏹' : '🎤'}</span>
           <span style={styles.micLabel}>{isListening ? 'Stop' : 'Translate'}</span>
         </button>
 
-        {/* Auto-speak toggle */}
         <div style={styles.autoSpeakToggle}>
           <span style={styles.toggleLabel}>Auto-speak translations</span>
-          <button
-            style={styles.toggle(autoSpeak)}
-            onClick={() => setAutoSpeak(!autoSpeak)}
-          >
+          <button style={styles.toggle(autoSpeak)} onClick={() => setAutoSpeak(!autoSpeak)}>
             <div style={styles.toggleKnob(autoSpeak)} />
           </button>
           {isSpeaking && <span style={styles.speakingIndicator} />}
         </div>
 
-        {/* Transcript area */}
         <div style={styles.transcript}>
           <div style={styles.transcriptHeader}>Translation Feed</div>
-
           {entries.length === 0 && !partial && (
-            <p style={{ color: '#444', fontStyle: 'italic', fontSize: '0.9rem' }}>
-              Translations will appear here...
-            </p>
+            <p style={{ color: '#444', fontStyle: 'italic', fontSize: '0.9rem' }}>Translations will appear here...</p>
           )}
-
           {entries.map((entry, i) => (
             <div key={i}>
               <div style={styles.originalText}>{entry.original}</div>
               <div style={styles.translatedText}>{entry.translated}</div>
             </div>
           ))}
-
           {partial && (
-            <div style={{ color: '#666', fontSize: '0.95rem', fontStyle: 'italic' }}>
-              {partial}...
-            </div>
+            <div style={{ color: '#666', fontSize: '0.95rem', fontStyle: 'italic' }}>{partial}...</div>
           )}
-
           <div ref={transcriptEndRef} />
         </div>
 
-        {/* Status */}
         <div style={styles.status}>{status}</div>
       </div>
     </div>

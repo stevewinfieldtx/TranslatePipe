@@ -9,6 +9,8 @@
   "dependencies": {
     "next": "latest",
     "react": "latest",
-    "react-dom": "latest"
+    "react-dom": "latest",
+    "@speechmatics/real-time-client": "latest",
+    "@speechmatics/auth": "latest"
   }
 }
