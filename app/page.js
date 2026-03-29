@@ -175,10 +175,11 @@ export default function TranslatePipe() {
   const processorRef = useRef(null);
   const ttsQueueRef = useRef([]);
   const isSpeakingRef = useRef(false);
-  const transcriptEndRef = useRef(null);
+  const transcriptBoxRef = useRef(null);
 
+  // Scroll to top when new entries arrive (newest first)
   useEffect(() => {
-    transcriptEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (transcriptBoxRef.current) transcriptBoxRef.current.scrollTop = 0;
   }, [entries, partial]);
 
   // ─── TTS Queue ──────────────────────────────────────────────────
@@ -277,7 +278,6 @@ export default function TranslatePipe() {
         }
       };
 
-      // Override onopen to track readiness (after StartRecognition is sent by createSmSession)
       const origOpenA = wsA.onopen;
       wsA.onopen = (e) => { origOpenA?.(e); checkReady(); };
       const origOpenB = wsB.onopen;
@@ -298,6 +298,10 @@ export default function TranslatePipe() {
     processorRef.current = processor;
 
     processor.onaudioprocess = (e) => {
+      // CRITICAL: Mute mic while TTS is playing to prevent feedback loop
+      // Without this, the agents hear each other's TTS output and re-translate it
+      if (isSpeakingRef.current) return;
+
       const inputData = e.inputBuffer.getChannelData(0);
       const buffer = new Float32Array(inputData).buffer;
 
@@ -409,23 +413,25 @@ export default function TranslatePipe() {
           {isSpeaking && <span style={styles.speakingIndicator} />}
         </div>
 
-        <div style={styles.transcript}>
+        <div style={styles.transcript} ref={transcriptBoxRef}>
           <div style={styles.transcriptHeader}>Translation Feed</div>
+
+          {partial && (
+            <div style={{ color: '#22c55e', fontSize: '0.95rem', fontStyle: 'italic', marginBottom: '14px', paddingBottom: '12px', borderBottom: '1px solid rgba(34,197,94,0.15)' }}>{partial}...</div>
+          )}
+
           {entries.length === 0 && !partial && (
             <p style={{ color: '#444', fontStyle: 'italic', fontSize: '0.9rem' }}>
               Speak in either language — translations appear here
             </p>
           )}
-          {entries.map((entry, i) => (
-            <div key={i}>
+
+          {[...entries].reverse().map((entry, i) => (
+            <div key={entries.length - 1 - i}>
               <div style={styles.originalText}>[{getLangLabel(entry.sourceLang)}] {entry.original}</div>
               <div style={styles.translatedText}>{entry.translated}</div>
             </div>
           ))}
-          {partial && (
-            <div style={{ color: '#666', fontSize: '0.95rem', fontStyle: 'italic' }}>{partial}...</div>
-          )}
-          <div ref={transcriptEndRef} />
         </div>
 
         <div style={styles.status}>{status}</div>
