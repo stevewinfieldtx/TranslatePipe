@@ -136,11 +136,15 @@ function createSmSession({ jwt, sourceLang, targetLang, onTranslation, onPartial
       case 'AddTranslation': {
         const translated = msg.results?.map(r => r.content).join(' ') || '';
         if (translated.trim()) {
+          // FIXED: Always use the targetLang we configured this session with.
+          // Previously used: msg.language || targetLang — which could be wrong.
+          // msg.language may return the source language code in some edge cases.
+          console.log(`[TTS-DEBUG] source=${sourceLang} target=${targetLang} msg.lang=${msg.language} text="${translated.trim().substring(0, 50)}"`);
           onTranslation({
             original: lastOriginal || '...',
             translated: translated.trim(),
             sourceLang,
-            targetLang: msg.language || targetLang,
+            targetLang,
           });
           lastOriginal = '';
         }
@@ -183,11 +187,17 @@ export default function TranslatePipe() {
   const transcriptBoxRef = useRef(null);
   const loudChunkCountRef = useRef(0);
   const thresholdRef = useRef(0.015);
+  const onVolumeRef = useRef(null);
 
-  // Scroll to top when new entries arrive (newest first)
   // Keep threshold ref in sync with slider
   useEffect(() => { thresholdRef.current = threshold; }, [threshold]);
 
+  // Volume meter callback
+  useEffect(() => {
+    onVolumeRef.current = (v) => setVolume(v);
+  }, []);
+
+  // Scroll to top when new entries arrive (newest first)
   useEffect(() => {
     if (transcriptBoxRef.current) transcriptBoxRef.current.scrollTop = 0;
   }, [entries, partial]);
@@ -203,6 +213,7 @@ export default function TranslatePipe() {
       setIsSpeaking(true);
       const { text: t, targetLang: lang } = ttsQueueRef.current.shift();
       try {
+        console.log(`[TTS-SPEAK] Speaking "${t.substring(0, 40)}..." in language=${lang}`);
         const res = await fetch('/api/tts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },

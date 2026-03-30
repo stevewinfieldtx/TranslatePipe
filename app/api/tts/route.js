@@ -30,6 +30,7 @@ export async function POST(request) {
     }
 
     const voice = voiceId || VOICE_MAP[language] || VOICE_MAP['en'];
+    console.log(`[TTS-ROUTE] language=${language} voice=${voice} text="${text.trim().substring(0, 50)}"`);
 
     const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voice}`, {
       method: 'POST',
