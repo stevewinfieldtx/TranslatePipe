@@ -87,12 +87,13 @@ const styles = {
 };
 
 // ─── Helper: create one Speechmatics WebSocket session ────────────
-function createSmSession({ jwt, sourceLang, targetLang, onTranslation, onPartial, onStatus, onError }) {
+function createSmSession({ jwt, sourceLang, targetLang, onTranslation, onPartial, onStatus, onError, onReady }) {
   const wsUrl = `wss://eu2.rt.speechmatics.com/v2/${sourceLang}?jwt=${jwt}`;
   const ws = new WebSocket(wsUrl);
   let lastOriginal = '';
 
   ws.onopen = () => {
+    console.log(`[SM] WebSocket opened for ${sourceLang}→${targetLang}`);
     ws.send(JSON.stringify({
       message: 'StartRecognition',
       audio_format: { type: 'raw', encoding: 'pcm_f32le', sample_rate: 16000 },
@@ -116,7 +117,9 @@ function createSmSession({ jwt, sourceLang, targetLang, onTranslation, onPartial
     const msg = JSON.parse(event.data);
     switch (msg.message) {
       case 'RecognitionStarted':
+        console.log(`[SM] RecognitionStarted for ${sourceLang}→${targetLang}`);
         onStatus(`${getLangLabel(sourceLang)} channel ready`);
+        if (onReady) onReady();
         break;
       case 'AddPartialTranscript': {
         const text = msg.metadata?.transcript || msg.results?.map(r => r.alternatives?.[0]?.content || '').join(' ') || '';
@@ -136,9 +139,6 @@ function createSmSession({ jwt, sourceLang, targetLang, onTranslation, onPartial
       case 'AddTranslation': {
         const translated = msg.results?.map(r => r.content).join(' ') || '';
         if (translated.trim()) {
-          // FIXED: Always use the targetLang we configured this session with.
-          // Previously used: msg.language || targetLang — which could be wrong.
-          // msg.language may return the source language code in some edge cases.
           console.log(`[TTS-DEBUG] source=${sourceLang} target=${targetLang} msg.lang=${msg.language} text="${translated.trim().substring(0, 50)}"`);
           onTranslation({
             original: lastOriginal || '...',
@@ -177,8 +177,8 @@ export default function TranslatePipe() {
   const [volume, setVolume] = useState(0);
   const [threshold, setThreshold] = useState(0.015);
 
-  const wsARef = useRef(null);   // Session A: listens for langA, translates to langB
-  const wsBRef = useRef(null);   // Session B: listens for langB, translates to langA
+  const wsARef = useRef(null);
+  const wsBRef = useRef(null);
   const mediaStreamRef = useRef(null);
   const audioContextRef = useRef(null);
   const processorRef = useRef(null);
@@ -189,15 +189,8 @@ export default function TranslatePipe() {
   const thresholdRef = useRef(0.015);
   const onVolumeRef = useRef(null);
 
-  // Keep threshold ref in sync with slider
   useEffect(() => { thresholdRef.current = threshold; }, [threshold]);
-
-  // Volume meter callback
-  useEffect(() => {
-    onVolumeRef.current = (v) => setVolume(v);
-  }, []);
-
-  // Scroll to top when new entries arrive (newest first)
+  useEffect(() => { onVolumeRef.current = (v) => setVolume(v); }, []);
   useEffect(() => {
     if (transcriptBoxRef.current) transcriptBoxRef.current.scrollTop = 0;
   }, [entries, partial]);
@@ -246,7 +239,6 @@ export default function TranslatePipe() {
       });
       mediaStreamRef.current = stream;
 
-      // Get token
       setStatus('Getting auth token...');
       const tokenRes = await fetch('/api/speechmatics-token', { method: 'POST' });
       const tokenData = await tokenRes.json();
@@ -264,7 +256,17 @@ export default function TranslatePipe() {
         speakText(entry.translated, entry.targetLang);
       };
 
-      // Session A: listens for langA → translates to langB
+      let readyCount = 0;
+      const checkReady = () => {
+        readyCount++;
+        console.log(`[SM] checkReady: ${readyCount}/2 sessions ready`);
+        if (readyCount >= 2) {
+          setIsListening(true);
+          setStatus(`Listening for ${getLangLabel(langA)} and ${getLangLabel(langB)}`);
+          startAudioPipeline(stream);
+        }
+      };
+
       const wsA = createSmSession({
         jwt: tokenData.key_value,
         sourceLang: langA,
@@ -273,10 +275,10 @@ export default function TranslatePipe() {
         onPartial: setPartial,
         onStatus: (s) => { setChannelAActive(true); setStatus(s); },
         onError: (e) => setStatus(e),
+        onReady: checkReady,
       });
       wsARef.current = wsA;
 
-      // Session B: listens for langB → translates to langA
       const wsB = createSmSession({
         jwt: tokenData.key_value,
         sourceLang: langB,
@@ -285,24 +287,9 @@ export default function TranslatePipe() {
         onPartial: setPartial,
         onStatus: (s) => { setChannelBActive(true); setStatus(s); },
         onError: (e) => setStatus(e),
+        onReady: checkReady,
       });
       wsBRef.current = wsB;
-
-      // Wait for both to open, then start audio pipeline
-      let readyCount = 0;
-      const checkReady = () => {
-        readyCount++;
-        if (readyCount >= 2) {
-          setIsListening(true);
-          setStatus(`Listening for ${getLangLabel(langA)} and ${getLangLabel(langB)}`);
-          startAudioPipeline(stream);
-        }
-      };
-
-      const origOpenA = wsA.onopen;
-      wsA.onopen = (e) => { origOpenA?.(e); checkReady(); };
-      const origOpenB = wsB.onopen;
-      wsB.onopen = (e) => { origOpenB?.(e); checkReady(); };
 
     } catch (err) {
       console.error('Start error:', err);
@@ -312,6 +299,7 @@ export default function TranslatePipe() {
 
   // ─── Audio pipeline: sends same mic audio to BOTH WebSockets ───
   const startAudioPipeline = useCallback((stream) => {
+    console.log('[AUDIO] Starting audio pipeline');
     const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
     audioContextRef.current = audioContext;
     const source = audioContext.createMediaStreamSource(stream);
@@ -319,7 +307,6 @@ export default function TranslatePipe() {
     processorRef.current = processor;
 
     processor.onaudioprocess = (e) => {
-      // Mute mic while TTS is playing — prevents feedback loop
       if (isSpeakingRef.current) {
         loudChunkCountRef.current = 0;
         if (onVolumeRef.current) onVolumeRef.current(0);
@@ -328,26 +315,19 @@ export default function TranslatePipe() {
 
       const inputData = e.inputBuffer.getChannelData(0);
 
-      // Calculate RMS volume
       let sum = 0;
       for (let i = 0; i < inputData.length; i++) {
         sum += inputData[i] * inputData[i];
       }
       const rms = Math.sqrt(sum / inputData.length);
 
-      // Update volume meter
       if (onVolumeRef.current) onVolumeRef.current(rms);
 
-      // Volume gate: 0.015 is the sweet spot
-      // Your voice close to mic: 0.03-0.3
-      // Distant conversation: 0.003-0.012
-      // Adjust up if still picking up distant, down if cutting your voice
       if (rms < thresholdRef.current) {
         loudChunkCountRef.current = 0;
         return;
       }
 
-      // Require 2 consecutive loud chunks to filter spikes
       loudChunkCountRef.current++;
       if (loudChunkCountRef.current < 2) return;
 
@@ -358,6 +338,7 @@ export default function TranslatePipe() {
 
     source.connect(processor);
     processor.connect(audioContext.destination);
+    console.log('[AUDIO] Pipeline connected and running');
   }, []);
 
   // ─── Stop ───────────────────────────────────────────────────────
@@ -429,7 +410,6 @@ export default function TranslatePipe() {
           </div>
         </div>
 
-        {/* Dual channel indicator */}
         {isListening && (
           <div style={styles.dualIndicator}>
             <div style={styles.channelDot(channelAActive)}>
@@ -443,7 +423,6 @@ export default function TranslatePipe() {
           </div>
         )}
 
-        {/* Volume meter + adjustable threshold slider */}
         {isListening && (
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '6px' }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', width: '100%' }}>
@@ -456,7 +435,6 @@ export default function TranslatePipe() {
                   borderRadius: '5px',
                   transition: 'width 0.05s ease-out',
                 }} />
-                {/* Threshold line */}
                 <div style={{ position: 'absolute', left: `${Math.min(threshold * 500, 100)}%`, top: '-2px', width: '2px', height: '14px', background: '#eab308', borderRadius: '1px' }} />
               </div>
               <span style={{ fontSize: '0.6rem', color: volume > threshold ? '#22c55e' : '#555', width: '40px', fontFamily: 'monospace' }}>{volume.toFixed(3)}</span>
