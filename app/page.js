@@ -175,7 +175,7 @@ export default function TranslatePipe() {
   const [channelAActive, setChannelAActive] = useState(false);
   const [channelBActive, setChannelBActive] = useState(false);
   const [volume, setVolume] = useState(0);
-  const [threshold, setThreshold] = useState(0.015);
+  const [threshold, setThreshold] = useState(0.005);
 
   const wsARef = useRef(null);
   const wsBRef = useRef(null);
@@ -186,7 +186,7 @@ export default function TranslatePipe() {
   const isSpeakingRef = useRef(false);
   const transcriptBoxRef = useRef(null);
   const loudChunkCountRef = useRef(0);
-  const thresholdRef = useRef(0.015);
+  const thresholdRef = useRef(0.005);
   const onVolumeRef = useRef(null);
 
   useEffect(() => { thresholdRef.current = threshold; }, [threshold]);
@@ -331,9 +331,26 @@ export default function TranslatePipe() {
       loudChunkCountRef.current++;
       if (loudChunkCountRef.current < 2) return;
 
-      const buffer = new Float32Array(inputData).buffer;
-      if (wsARef.current?.readyState === WebSocket.OPEN) wsARef.current.send(buffer.slice(0));
-      if (wsBRef.current?.readyState === WebSocket.OPEN) wsBRef.current.send(buffer.slice(0));
+      // FIXED: Explicitly copy the Float32 data to avoid detached buffer issues
+      // ScriptProcessor can detach the original buffer before send() completes
+      const copy = new Float32Array(inputData.length);
+      copy.set(inputData);
+      const audioBytes = copy.buffer;
+
+      let sent = 0;
+      if (wsARef.current?.readyState === WebSocket.OPEN) { wsARef.current.send(audioBytes); sent++; }
+      // Session B needs its own copy — can't reuse the same ArrayBuffer after send()
+      if (wsBRef.current?.readyState === WebSocket.OPEN) { 
+        const copy2 = new Float32Array(inputData.length);
+        copy2.set(inputData);
+        wsBRef.current.send(copy2.buffer); 
+        sent++; 
+      }
+      
+      // Log every 20th send to avoid flooding console
+      if (loudChunkCountRef.current % 20 === 0) {
+        console.log(`[AUDIO] Sending chunk #${loudChunkCountRef.current}, rms: ${rms.toFixed(4)}, bytes: ${audioBytes.byteLength}, sent to ${sent} sessions`);
+      }
     };
 
     source.connect(processor);
