@@ -47,6 +47,12 @@ export default function TranslatePipe() {
     while (ttsQueueRef.current.length > 0) {
       isSpeakingRef.current = true;
       setIsSpeaking(true);
+      
+      // Mute the actual mic track so no audio reaches WebSocket at all
+      if (mediaRef.current) {
+        mediaRef.current.getAudioTracks().forEach(t => t.enabled = false);
+      }
+      
       const item = ttsQueueRef.current.shift();
       try {
         console.log(`[TTS] Speaking "${item.text.substring(0, 40)}..." lang=${item.lang}`);
@@ -61,12 +67,20 @@ export default function TranslatePipe() {
           const audio = new Audio(url);
           await new Promise(resolve => { audio.onended = resolve; audio.onerror = resolve; audio.play().catch(resolve); });
           URL.revokeObjectURL(url);
+          // Cooldown: wait 500ms after TTS ends before unmuting mic
+          // This prevents the mic from catching the speaker's tail resonance
+          await new Promise(resolve => setTimeout(resolve, 500));
         } else {
           console.error('[TTS] Failed:', res.status);
         }
       } catch (err) {
         console.error('[TTS] Error:', err);
       }
+    }
+    
+    // Re-enable mic track
+    if (mediaRef.current) {
+      mediaRef.current.getAudioTracks().forEach(t => t.enabled = true);
     }
     isSpeakingRef.current = false;
     setIsSpeaking(false);
@@ -93,7 +107,6 @@ export default function TranslatePipe() {
       }
 
       // 3. Open TWO Speechmatics sessions
-      // Using the EXACT same pattern as the working /test page
       setStatus('Connecting...');
       let readyCount = 0;
 
@@ -102,8 +115,6 @@ export default function TranslatePipe() {
         console.log(`[SM] Sessions ready: ${readyCount}/2`);
         if (readyCount < 2) return;
 
-        // Both sessions ready -- start audio pipeline
-        // SAME pattern as working test: create audio context, connect, send
         console.log('[AUDIO] Both sessions ready, starting pipeline');
         const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
         ctxRef.current = audioContext;
@@ -119,8 +130,6 @@ export default function TranslatePipe() {
 
           const inputData = e.inputBuffer.getChannelData(0);
 
-          // NO volume gate -- send everything, just like the working test
-          // We can add filtering back later once translation works
           const wsA = wsARef.current;
           const wsB = wsBRef.current;
 
@@ -257,8 +266,6 @@ export default function TranslatePipe() {
 }
 
 // ─── Open one Speechmatics session ────────────────────────────────
-// Mirrors the EXACT working pattern from /test page
-// NO audio_filtering_config, NO volume_threshold
 function openSession(jwt, sourceLang, targetLang, onReady, onTranslation, onPartial) {
   const ws = new WebSocket(`wss://eu2.rt.speechmatics.com/v2/${sourceLang}?jwt=${jwt}`);
   let lastOriginal = '';
@@ -273,7 +280,6 @@ function openSession(jwt, sourceLang, targetLang, onReady, onTranslation, onPart
         operating_point: 'enhanced',
         enable_partials: true,
         max_delay: 2.0,
-        // NO audio_filtering_config -- that was killing it
       },
       translation_config: {
         target_languages: [targetLang],
