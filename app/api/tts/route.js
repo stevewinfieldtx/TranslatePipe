@@ -1,70 +1,88 @@
-// Proxy for ElevenLabs TTS. Takes translated text + target language voice,
-// returns audio stream. Keeps ElevenLabs API key server-side.
-
-// Default voices per language — can be overridden
-const VOICE_MAP = {
-  en: 'JBFqnCBsd6RMkjVDRZzb',  // George — clear male English
-  vi: 'pFZP5JQG7iQjIQuC4Bku',  // Lily — works well for Vietnamese
-  es: 'onwK4e9ZLuTAKqWW03F9',  // Daniel
-  fr: 'XB0fDUnXU5powFXDhCwa',  // Charlotte
-  de: 'pqHfZKP75CvOlQylNhV4',  // Bill
-  ja: 'Xb7hH8MSUJpSbSDYk0k2',  // Alice
-  ko: 'pFZP5JQG7iQjIQuC4Bku',  // Lily
-  zh: 'Xb7hH8MSUJpSbSDYk0k2',  // Alice
-  pt: 'onwK4e9ZLuTAKqWW03F9',  // Daniel
-  th: 'pFZP5JQG7iQjIQuC4Bku',  // Lily
-  hi: 'pFZP5JQG7iQjIQuC4Bku',  // Lily
-};
+// MiniMax TTS proxy. Takes translated text + target language,
+// returns audio stream. Keeps API key server-side.
+//
+// MiniMax Speech-02 supports 40+ languages including Vietnamese.
+// Docs: https://platform.minimax.io/docs/api-reference/speech-t2a-intro
 
 export async function POST(request) {
-  const apiKey = process.env.ELEVENLABS_API_KEY;
+  const apiKey = process.env.MINIMAX_API_KEY;
   if (!apiKey) {
-    return Response.json({ error: 'ELEVENLABS_API_KEY not set' }, { status: 500 });
+    return Response.json({ error: 'MINIMAX_API_KEY not set' }, { status: 500 });
   }
 
   try {
-    const { text, language, voiceId } = await request.json();
+    const { text, language } = await request.json();
 
     if (!text || !text.trim()) {
       return Response.json({ error: 'No text provided' }, { status: 400 });
     }
 
-    const voice = voiceId || VOICE_MAP[language] || VOICE_MAP['en'];
-    console.log(`[TTS-ROUTE] language=${language} voice=${voice} text="${text.trim().substring(0, 50)}"`);
+    console.log(`[TTS] MiniMax language=${language} text="${text.trim().substring(0, 50)}"`);
 
-    const res = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voice}`, {
+    // MiniMax non-streaming TTS — returns hex-encoded audio
+    const res = await fetch('https://api.minimaxi.chat/v1/t2a_v2', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'xi-api-key': apiKey,
+        'Authorization': `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
+        model: 'speech-02-turbo',
         text: text.trim(),
-        model_id: 'eleven_turbo_v2_5', // fastest multilingual model
-        voice_settings: {
-          stability: 0.5,
-          similarity_boost: 0.75,
-          style: 0.0, // no style exaggeration for clean translation
-          use_speaker_boost: true,
+        stream: false,
+        voice_setting: {
+          voice_id: 'male-qn-qingse',
+          speed: 1.0,
+          vol: 1.0,
+          pitch: 0,
+        },
+        audio_setting: {
+          sample_rate: 32000,
+          bitrate: 128000,
+          format: 'mp3',
+          channel: 1,
         },
       }),
     });
 
     if (!res.ok) {
       const errText = await res.text();
-      console.error('ElevenLabs TTS error:', res.status, errText);
-      return Response.json({ error: 'TTS failed' }, { status: res.status });
+      console.error('[TTS] MiniMax error:', res.status, errText);
+      return Response.json({ error: 'TTS failed: ' + res.status }, { status: res.status });
     }
 
-    // Stream the audio back
-    return new Response(res.body, {
+    const data = await res.json();
+
+    // Check for API-level errors
+    if (data.base_resp?.status_code !== 0) {
+      console.error('[TTS] MiniMax API error:', data.base_resp);
+      return Response.json({ error: 'TTS API error: ' + (data.base_resp?.status_msg || 'unknown') }, { status: 500 });
+    }
+
+    // MiniMax returns audio as hex string in data.data.audio
+    const audioHex = data.data?.audio;
+    if (!audioHex) {
+      console.error('[TTS] No audio in response');
+      return Response.json({ error: 'No audio returned' }, { status: 500 });
+    }
+
+    // Convert hex to binary buffer
+    const audioBuffer = Buffer.from(audioHex, 'hex');
+    console.log(`[TTS] Generated ${audioBuffer.length} bytes of audio`);
+
+    return new Response(audioBuffer, {
       headers: {
         'Content-Type': 'audio/mpeg',
         'Cache-Control': 'no-cache',
       },
     });
+
   } catch (err) {
-    console.error('TTS error:', err);
+    console.error('[TTS] Error:', err);
     return Response.json({ error: 'TTS request failed' }, { status: 500 });
   }
+}
+
+export async function GET() {
+  return Response.json({ status: 'MiniMax TTS endpoint ready' });
 }
