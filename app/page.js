@@ -16,6 +16,20 @@ const LANGUAGES = [
   { code: 'hi', label: 'Hindi',      flag: '🇮🇳' },
 ];
 
+// Speechmatics bilingual packs — one session handles both languages
+// For pairs WITHOUT a bilingual pack, we fall back to dual sessions
+const BILINGUAL_PACKS = {
+  'en+es': { language: 'es', domain: 'bilingual-en' },
+  'en+cmn': { language: 'cmn_en' },
+  'en+ar': { language: 'ar_en' },
+  'en+ms': { language: 'en_ms' },
+  'en+ta': { language: 'en_ta' },
+};
+
+function getBilingualConfig(a, b) {
+  return BILINGUAL_PACKS[`${a}+${b}`] || BILINGUAL_PACKS[`${b}+${a}`] || null;
+}
+
 const getLangLabel = (code) => LANGUAGES.find(l => l.code === code)?.label || code;
 
 export default function TranslatePipe() {
@@ -29,11 +43,15 @@ export default function TranslatePipe() {
   const [isSpeaking, setIsSpeaking] = useState(false);
 
   const wsRef = useRef(null);
+  const wsARef = useRef(null);
+  const wsBRef = useRef(null);
   const mediaRef = useRef(null);
   const ctxRef = useRef(null);
   const procRef = useRef(null);
   const ttsQueueRef = useRef([]);
   const isSpeakingRef = useRef(false);
+
+  const bilingualPack = getBilingualConfig(langA, langB);
 
   // ─── TTS with hardware mic mute + cooldown ─────────────────────
   const speakText = useCallback(async (text, lang) => {
@@ -71,140 +89,25 @@ export default function TranslatePipe() {
     setIsSpeaking(false);
   }, [autoSpeak]);
 
-  // ─── Start ──────────────────────────────────────────────────────
-  const start = useCallback(async () => {
-    try {
-      // 1. Mic
-      setStatus('Getting microphone...');
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true },
-      });
-      mediaRef.current = stream;
-
-      // 2. Token
-      setStatus('Authenticating...');
-      const tokenRes = await fetch('/api/speechmatics-token');
-      const tokenData = await tokenRes.json();
-      if (!tokenData.key_value) {
-        setStatus('Auth failed: ' + (tokenData.error || 'no token'));
-        stream.getTracks().forEach(t => t.stop());
-        return;
-      }
-
-      // 3. Single WebSocket — auto language detect, translate to both
-      setStatus('Connecting...');
-      const ws = new WebSocket(`wss://eu2.rt.speechmatics.com/v2?jwt=${tokenData.key_value}`);
-      wsRef.current = ws;
-
-      let lastOriginal = '';
-      let detectedLang = '';
-
-      ws.onopen = () => {
-        console.log('[SM] Connected');
-        ws.send(JSON.stringify({
-          message: 'StartRecognition',
-          audio_format: { type: 'raw', encoding: 'pcm_f32le', sample_rate: 16000 },
-          transcription_config: {
-            language: 'auto',
-            operating_point: 'enhanced',
-            enable_partials: true,
-            max_delay: 2.0,
-            language_identification_config: {
-              expected_languages: [langA, langB],
-            },
-          },
-          translation_config: {
-            target_languages: [langA, langB],
-            enable_partials: true,
-          },
-        }));
-      };
-
-      ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
-
-        if (msg.message === 'RecognitionStarted') {
-          console.log('[SM] RecognitionStarted (auto)');
-          setRunning(true);
-          setStatus(`Listening — speak ${getLangLabel(langA)} or ${getLangLabel(langB)}`);
-          startAudio(stream, ws);
-        }
-
-        if (msg.message === 'AddPartialTranscript') {
-          const text = msg.metadata?.transcript || msg.results?.map(r => r.alternatives?.[0]?.content || '').join(' ') || '';
-          const lang = msg.results?.[0]?.alternatives?.[0]?.language || '';
-          if (text.trim()) setPartial(`[${getLangLabel(lang) || '?'}] ${text.trim()}`);
-        }
-
-        if (msg.message === 'AddTranscript') {
-          const text = msg.metadata?.transcript || msg.results?.map(r => r.alternatives?.[0]?.content || '').join(' ') || '';
-          detectedLang = msg.results?.[0]?.alternatives?.[0]?.language || '';
-          if (text.trim()) {
-            lastOriginal = text.trim();
-            console.log(`[SM] Transcript (${detectedLang}): "${lastOriginal}"`);
-          }
-        }
-
-        if (msg.message === 'AddPartialTranslation') {
-          const lang = msg.language || '';
-          const pt = msg.results?.map(r => r.content).join(' ') || '';
-          if (pt.trim() && lang !== detectedLang) {
-            setPartial(`→ [${getLangLabel(lang)}] ${pt.trim()}`);
-          }
-        }
-
-        if (msg.message === 'AddTranslation') {
-          const tLang = msg.language || '';
-          const translated = msg.results?.map(r => r.content).join(' ') || '';
-
-          if (translated.trim() && tLang !== detectedLang) {
-            console.log(`[TRANSLATE] ${detectedLang}→${tLang}: "${translated.trim().substring(0, 60)}"`);
-            setPartial('');
-            const entry = {
-              original: lastOriginal || '...',
-              translated: translated.trim(),
-              sourceLang: detectedLang,
-              targetLang: tLang,
-            };
-            setEntries(prev => [entry, ...prev]);
-            speakText(entry.translated, entry.targetLang);
-          }
-        }
-
-        if (msg.message === 'Error') {
-          console.error('[SM ERROR]', msg);
-          setStatus(`Error: ${msg.reason || msg.type || JSON.stringify(msg)}`);
-        }
-      };
-
-      ws.onerror = () => setStatus('Connection error');
-      ws.onclose = (e) => {
-        console.log(`[SM] Closed: ${e.code} ${e.reason}`);
-        if (e.code !== 1000) setStatus(`Disconnected: ${e.reason || e.code}`);
-      };
-
-    } catch (err) {
-      console.error('[START]', err);
-      setStatus('Error: ' + err.message);
-    }
-  }, [langA, langB, speakText]);
-
-  // ─── Audio pipeline (same proven pattern as /test page) ────────
-  const startAudio = (stream, ws) => {
+  // ─── Audio pipeline — sends to one or two WebSockets ───────────
+  const startAudio = (stream, wsList) => {
     const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
     ctxRef.current = ctx;
     const source = ctx.createMediaStreamSource(stream);
     const proc = ctx.createScriptProcessor(4096, 1, 1);
     procRef.current = proc;
-
     let n = 0;
+
     proc.onaudioprocess = (e) => {
       if (isSpeakingRef.current) return;
-      if (ws.readyState !== WebSocket.OPEN) return;
       const d = e.inputBuffer.getChannelData(0);
-      const copy = new Float32Array(d.length);
-      copy.set(d);
-      ws.send(copy.buffer);
+      for (const ws of wsList) {
+        if (ws?.readyState === WebSocket.OPEN) {
+          const copy = new Float32Array(d.length);
+          copy.set(d);
+          ws.send(copy.buffer);
+        }
+      }
       if (++n % 50 === 0) {
         let s = 0; for (let i = 0; i < d.length; i++) s += d[i]*d[i];
         console.log(`[AUDIO] #${n} rms=${Math.sqrt(s/d.length).toFixed(4)}`);
@@ -216,15 +119,154 @@ export default function TranslatePipe() {
     console.log('[AUDIO] Running');
   };
 
+  // ─── Translation handler (shared by both modes) ────────────────
+  const handleTranslation = useCallback((entry) => {
+    setPartial('');
+    setEntries(prev => [entry, ...prev]);
+    speakText(entry.translated, entry.targetLang);
+  }, [speakText]);
+
+  // ─── Start ─────────────────────────────────────────────────────
+  const start = useCallback(async () => {
+    try {
+      setStatus('Getting microphone...');
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, sampleRate: 16000, echoCancellation: true, noiseSuppression: true },
+      });
+      mediaRef.current = stream;
+
+      setStatus('Authenticating...');
+      const tokenRes = await fetch('/api/speechmatics-token');
+      const tokenData = await tokenRes.json();
+      if (!tokenData.key_value) {
+        setStatus('Auth failed: ' + (tokenData.error || 'no token'));
+        stream.getTracks().forEach(t => t.stop());
+        return;
+      }
+
+      const jwt = tokenData.key_value;
+
+      if (bilingualPack) {
+        // ═══ BILINGUAL MODE ═══════════════════════════════════════
+        // Single session handles both languages natively
+        console.log('[SM] Bilingual mode:', bilingualPack);
+        setStatus('Connecting (bilingual)...');
+
+        const urlLang = bilingualPack.language;
+        const ws = new WebSocket(`wss://eu2.rt.speechmatics.com/v2/${urlLang}?jwt=${jwt}`);
+        wsRef.current = ws;
+        let lastOriginal = '';
+        let detectedLang = '';
+
+        ws.onopen = () => {
+          console.log('[SM] Connected (bilingual)');
+          const config = {
+            message: 'StartRecognition',
+            audio_format: { type: 'raw', encoding: 'pcm_f32le', sample_rate: 16000 },
+            transcription_config: {
+              language: urlLang,
+              operating_point: 'enhanced',
+              enable_partials: true,
+              max_delay: 2.0,
+            },
+            translation_config: {
+              target_languages: [langA, langB],
+              enable_partials: true,
+            },
+          };
+          if (bilingualPack.domain) {
+            config.transcription_config.domain = bilingualPack.domain;
+          }
+          ws.send(JSON.stringify(config));
+        };
+
+        ws.onmessage = (event) => {
+          const msg = JSON.parse(event.data);
+
+          if (msg.message === 'RecognitionStarted') {
+            console.log('[SM] RecognitionStarted (bilingual)');
+            setRunning(true);
+            setStatus(`Listening — speak ${getLangLabel(langA)} or ${getLangLabel(langB)}`);
+            startAudio(stream, [ws]);
+          }
+
+          if (msg.message === 'AddPartialTranscript') {
+            const text = msg.metadata?.transcript || msg.results?.map(r => r.alternatives?.[0]?.content || '').join(' ') || '';
+            const lang = msg.results?.[0]?.alternatives?.[0]?.language || '';
+            if (text.trim()) setPartial(`[${getLangLabel(lang) || '?'}] ${text.trim()}`);
+          }
+
+          if (msg.message === 'AddTranscript') {
+            const text = msg.metadata?.transcript || msg.results?.map(r => r.alternatives?.[0]?.content || '').join(' ') || '';
+            detectedLang = msg.results?.[0]?.alternatives?.[0]?.language || '';
+            if (text.trim()) {
+              lastOriginal = text.trim();
+              console.log(`[SM] Transcript (${detectedLang}): "${lastOriginal}"`);
+            }
+          }
+
+          if (msg.message === 'AddPartialTranslation') {
+            const lang = msg.language || '';
+            const pt = msg.results?.map(r => r.content).join(' ') || '';
+            if (pt.trim() && lang !== detectedLang) setPartial(`-> [${getLangLabel(lang)}] ${pt.trim()}`);
+          }
+
+          if (msg.message === 'AddTranslation') {
+            const tLang = msg.language || '';
+            const translated = msg.results?.map(r => r.content).join(' ') || '';
+            if (translated.trim() && tLang !== detectedLang) {
+              console.log(`[TRANSLATE] ${detectedLang}->${tLang}: "${translated.trim().substring(0, 60)}"`);
+              handleTranslation({ original: lastOriginal || '...', translated: translated.trim(), sourceLang: detectedLang, targetLang: tLang });
+            }
+          }
+
+          if (msg.message === 'Error') {
+            console.error('[SM ERROR]', msg);
+            setStatus(`Error: ${msg.reason || msg.type || JSON.stringify(msg)}`);
+          }
+        };
+
+        ws.onerror = () => setStatus('Connection error');
+        ws.onclose = (e) => console.log(`[SM] Closed: ${e.code} ${e.reason}`);
+
+      } else {
+        // ═══ DUAL SESSION MODE ════════════════════════════════════
+        // No bilingual pack available — use two sessions
+        console.log(`[SM] Dual mode: ${langA} + ${langB}`);
+        setStatus('Connecting (dual)...');
+
+        let readyCount = 0;
+        const checkReady = () => {
+          readyCount++;
+          console.log(`[SM] Sessions ready: ${readyCount}/2`);
+          if (readyCount >= 2) {
+            setRunning(true);
+            setStatus(`Listening — speak ${getLangLabel(langA)} or ${getLangLabel(langB)} (dual mode)`);
+            startAudio(stream, [wsARef.current, wsBRef.current]);
+          }
+        };
+
+        wsARef.current = openSession(jwt, langA, langB, checkReady, handleTranslation, setPartial);
+        wsBRef.current = openSession(jwt, langB, langA, checkReady, handleTranslation, setPartial);
+      }
+
+    } catch (err) {
+      console.error('[START]', err);
+      setStatus('Error: ' + err.message);
+    }
+  }, [langA, langB, bilingualPack, speakText, handleTranslation]);
+
   // ─── Stop ──────────────────────────────────────────────────────
   const stop = useCallback(() => {
-    if (wsRef.current) {
-      try {
-        if (wsRef.current.readyState === WebSocket.OPEN) wsRef.current.send(JSON.stringify({ message: 'EndOfStream' }));
-        wsRef.current.close();
-      } catch(e) {}
-      wsRef.current = null;
-    }
+    [wsRef, wsARef, wsBRef].forEach(ref => {
+      if (ref.current) {
+        try {
+          if (ref.current.readyState === WebSocket.OPEN) ref.current.send(JSON.stringify({ message: 'EndOfStream' }));
+          ref.current.close();
+        } catch(e) {}
+        ref.current = null;
+      }
+    });
     if (procRef.current) { procRef.current.disconnect(); procRef.current = null; }
     if (ctxRef.current) { ctxRef.current.close().catch(()=>{}); ctxRef.current = null; }
     if (mediaRef.current) { mediaRef.current.getTracks().forEach(t => t.stop()); mediaRef.current = null; }
@@ -249,7 +291,7 @@ export default function TranslatePipe() {
               {LANGUAGES.filter(l=>l.code!==langB).map(l=><option key={l.code} value={l.code}>{l.flag}  {l.label}</option>)}
             </select>
           </div>
-          <button style={S.swap} onClick={swapLangs} disabled={running}>⇄</button>
+          <button style={S.swap} onClick={swapLangs} disabled={running}>&#8644;</button>
           <div>
             <div style={S.ll}>Language B</div>
             <select style={S.sel} value={langB} onChange={e=>setLangB(e.target.value)} disabled={running}>
@@ -258,8 +300,11 @@ export default function TranslatePipe() {
           </div>
         </div>
 
+        {bilingualPack && <div style={S.badge}>Bilingual mode available</div>}
+        {!bilingualPack && langA && langB && <div style={S.badgeWarn}>Dual session mode (may interleave)</div>}
+
         <button style={S.mic(running)} onClick={running ? stop : start}>
-          <span style={{fontSize:'2.2rem'}}>{running ? '⏹' : '🎤'}</span>
+          <span style={{fontSize:'2.2rem'}}>{running ? '\u23F9' : '\uD83C\uDFA4'}</span>
           <span style={S.ml}>{running ? 'Stop' : 'Translate'}</span>
         </button>
 
@@ -289,6 +334,52 @@ export default function TranslatePipe() {
   );
 }
 
+// ─── Dual session helper (for non-bilingual pairs) ───────────────
+function openSession(jwt, sourceLang, targetLang, onReady, onTranslation, onPartial) {
+  const ws = new WebSocket(`wss://eu2.rt.speechmatics.com/v2/${sourceLang}?jwt=${jwt}`);
+  let lastOriginal = '';
+
+  ws.onopen = () => {
+    console.log(`[SM] Opened ${sourceLang}->${targetLang}`);
+    ws.send(JSON.stringify({
+      message: 'StartRecognition',
+      audio_format: { type: 'raw', encoding: 'pcm_f32le', sample_rate: 16000 },
+      transcription_config: { language: sourceLang, operating_point: 'enhanced', enable_partials: true, max_delay: 2.0 },
+      translation_config: { target_languages: [targetLang], enable_partials: true },
+    }));
+  };
+
+  ws.onmessage = (event) => {
+    const msg = JSON.parse(event.data);
+    if (msg.message === 'RecognitionStarted') { console.log(`[SM] Ready ${sourceLang}->${targetLang}`); onReady(); }
+    if (msg.message === 'AddPartialTranscript') {
+      const text = msg.metadata?.transcript || msg.results?.map(r => r.alternatives?.[0]?.content || '').join(' ') || '';
+      if (text.trim()) onPartial(`[${getLangLabel(sourceLang)}] ${text.trim()}`);
+    }
+    if (msg.message === 'AddTranscript') {
+      const text = msg.metadata?.transcript || msg.results?.map(r => r.alternatives?.[0]?.content || '').join(' ') || '';
+      if (text.trim()) lastOriginal = text.trim();
+    }
+    if (msg.message === 'AddPartialTranslation') {
+      const pt = msg.results?.map(r => r.content).join(' ') || '';
+      if (pt.trim()) onPartial(`-> ${pt.trim()}`);
+    }
+    if (msg.message === 'AddTranslation') {
+      const translated = msg.results?.map(r => r.content).join(' ') || '';
+      if (translated.trim()) {
+        console.log(`[TRANSLATE] ${sourceLang}->${targetLang}: "${translated.trim().substring(0, 60)}"`);
+        onTranslation({ original: lastOriginal || '...', translated: translated.trim(), sourceLang, targetLang });
+        lastOriginal = '';
+      }
+    }
+    if (msg.message === 'Error') console.error(`[SM ERROR] ${sourceLang}:`, msg);
+  };
+
+  ws.onerror = () => console.error(`[SM] Error ${sourceLang}`);
+  ws.onclose = (e) => console.log(`[SM] Closed ${sourceLang}: ${e.code}`);
+  return ws;
+}
+
 // ─── Styles ──────────────────────────────────────────────────────
 const S = {
   page:{minHeight:'100vh',background:'linear-gradient(145deg,#0a0a0f,#12121f,#0a0f1a)',color:'#e0e0e0',fontFamily:"'SF Pro Display',-apple-system,sans-serif",display:'flex',flexDirection:'column',alignItems:'center',padding:'40px 20px'},
@@ -299,6 +390,8 @@ const S = {
   ll:{fontSize:'.65rem',textTransform:'uppercase',letterSpacing:'.15em',color:'#555',textAlign:'center',marginBottom:'4px'},
   sel:{background:'rgba(255,255,255,.05)',border:'1px solid rgba(255,255,255,.1)',borderRadius:'12px',color:'#fff',padding:'14px 20px',fontSize:'1rem',minWidth:'200px',cursor:'pointer',outline:'none'},
   swap:{background:'rgba(255,255,255,.05)',border:'1px solid rgba(255,255,255,.12)',borderRadius:'50%',width:'48px',height:'48px',display:'flex',alignItems:'center',justifyContent:'center',cursor:'pointer',fontSize:'1.3rem',color:'#aaa'},
+  badge:{textAlign:'center',fontSize:'.7rem',color:'#22c55e',letterSpacing:'.1em'},
+  badgeWarn:{textAlign:'center',fontSize:'.7rem',color:'#eab308',letterSpacing:'.1em'},
   mic:(on)=>({width:'120px',height:'120px',borderRadius:'50%',border:on?'3px solid #22c55e':'3px solid rgba(255,255,255,.15)',background:on?'radial-gradient(circle,rgba(34,197,94,.25),rgba(34,197,94,.05))':'radial-gradient(circle,rgba(255,255,255,.08),rgba(255,255,255,.02))',cursor:'pointer',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',gap:'4px',transition:'all .3s',margin:'20px auto',boxShadow:on?'0 0 40px rgba(34,197,94,.2)':'none'}),
   ml:{fontSize:'.65rem',textTransform:'uppercase',letterSpacing:'.15em',color:'#888'},
   tr:{display:'flex',alignItems:'center',justifyContent:'center',gap:'10px'},
